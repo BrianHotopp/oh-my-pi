@@ -19,6 +19,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { clampTimeout, resolveLspTimeouts, TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 import {
 	applyWorkspaceEditWithLsp,
+	assertRustDocumentAttached,
 	clearInitializationFailure,
 	getActiveClients,
 	getOrCreateClient,
@@ -365,6 +366,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						}
 						const minVersion = client.diagnosticsVersion;
 						await refreshFile(client, resolved, signal);
+						await assertRustDocumentAttached(client, uri, signal);
 						const expectedDocumentVersion = client.openFiles.get(uri)?.version;
 						// Project-aware servers (Roslyn, tsserver, …) compute pull diagnostics
 						// on demand; their first response routinely overruns the 3s single-file
@@ -390,11 +392,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							throw err;
 						}
 						// Server failed; record it so a total failure is not reported as clean.
-						failedServers.push(serverName);
+						const error = err instanceof Error ? err.message : String(err);
+						failedServers.push(`${serverName}: ${error}`);
 						logger.debug("LSP diagnostics server failed", {
 							server: serverName,
 							file: relPath,
-							error: err instanceof Error ? err.message : String(err),
+							error,
 						});
 					}
 				}
