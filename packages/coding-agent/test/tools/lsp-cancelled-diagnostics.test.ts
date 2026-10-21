@@ -5,12 +5,13 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
-import type { Diagnostic, LspClient, ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
+import type { Diagnostic, ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { LspToolDetails } from "@oh-my-pi/pi-tui/tools/lsp";
-import { ptree, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { installHandshakeLsp } from "../helpers/fake-lsp";
 
 const realImmediate = globalThis.setImmediate;
 const CLEAN = "pub fn value() -> u32 { 1 }\n";
@@ -22,21 +23,6 @@ const MISMATCH: Diagnostic = {
 	source: "rust-analyzer",
 	range: { start: { line: 0, character: 24 }, end: { line: 0, character: 31 } },
 };
-
-interface RpcMessage {
-	jsonrpc?: string;
-	id?: number | string;
-	method?: string;
-	params?: {
-		textDocument?: { uri: string; text?: string };
-		token?: string;
-		value?: { kind: string };
-		uri?: string;
-		diagnostics?: Diagnostic[];
-	};
-	result?: unknown;
-	error?: { code: number; message: string; data?: { retriggerRequest: boolean } };
-}
 
 class DiagnosticClock {
 	now = 1_000_000;
@@ -87,7 +73,7 @@ class DiagnosticClock {
 	}
 }
 
-/** Framed JSON-RPC peer using the real client's in-memory subprocess transport. */
+/** Rust diagnostic responses layered on the shared in-memory LSP transport. */
 class CancellingRustServer {
 	cancellationsRemaining = 0;
 	cancellationData: { retriggerRequest: boolean } | undefined;
@@ -96,110 +82,57 @@ class CancellingRustServer {
 	#documents = new Map<string, string>();
 
 	install(): void {
-		const encoder = new TextEncoder();
-		let controller: ReadableStreamDefaultController<Uint8Array>;
-		let exitCode: number | null = null;
-		const { promise: exited, resolve: resolveExited } = Promise.withResolvers<number>();
-		const stdout = new ReadableStream<Uint8Array>({
-			start(c) {
-				controller = c;
-			},
-		});
-		const send = (message: RpcMessage) => {
-			if (exitCode !== null) return;
-			const content = JSON.stringify(message);
-			controller.enqueue(encoder.encode(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`));
-		};
-		const exit = () => {
-			if (exitCode !== null) return;
-			exitCode = 0;
-			controller.close();
-			resolveExited(0);
-		};
-		const handle = (message: RpcMessage) => {
-			if (message.method === "initialize") {
-				send({ jsonrpc: "2.0", id: message.id, result: { capabilities: { diagnosticProvider: true } } });
-				for (const kind of ["begin", "end"]) {
-					send({ jsonrpc: "2.0", method: "$/progress", params: { token: "workspace", value: { kind } } });
-				}
-			} else if (message.method === "rust-analyzer/analyzerStatus") {
-				send({ jsonrpc: "2.0", id: message.id, result: "Workspace loaded: 1 crate" });
-			} else if (message.method === "textDocument/didOpen") {
-				this.#documents.set(message.params!.textDocument!.uri, message.params!.textDocument!.text!);
-			} else if (message.method === "textDocument/diagnostic") {
-				if (this.cancellationsRemaining > 0) {
-					this.cancellationsRemaining--;
-					this.cancelledPulls++;
-					send({
-						jsonrpc: "2.0",
-						id: message.id,
-						error: { code: -32802, message: "server cancelled the request", data: this.cancellationData },
-					});
-					const diagnostics = this.publishOnCancellation;
-					if (diagnostics) {
-						setTimeout(
-							() =>
-								send({
-									jsonrpc: "2.0",
-									method: "textDocument/publishDiagnostics",
-									params: { uri: message.params!.textDocument!.uri, diagnostics },
-								}),
-							250,
-						);
+		installHandshakeLsp(
+			(message, server) => {
+				if (message.method === "initialize") {
+					for (const kind of ["begin", "end"]) {
+						server.send({
+							jsonrpc: "2.0",
+							method: "$/progress",
+							params: { token: "workspace", value: { kind } },
+						});
 					}
-					return;
+				} else if (message.method === "rust-analyzer/analyzerStatus") {
+					server.send({ jsonrpc: "2.0", id: message.id, result: "Workspace loaded: 1 crate" });
+				} else if (message.method === "textDocument/didOpen") {
+					const { textDocument } = message.params as { textDocument: { uri: string; text: string } };
+					this.#documents.set(textDocument.uri, textDocument.text);
+				} else if (message.method === "textDocument/diagnostic") {
+					const { textDocument } = message.params as { textDocument: { uri: string } };
+					if (this.cancellationsRemaining > 0) {
+						this.cancellationsRemaining--;
+						this.cancelledPulls++;
+						server.send({
+							jsonrpc: "2.0",
+							id: message.id,
+							error: { code: -32802, message: "server cancelled the request", data: this.cancellationData },
+						});
+						const diagnostics = this.publishOnCancellation;
+						if (diagnostics) {
+							setTimeout(
+								() =>
+									server.send({
+										jsonrpc: "2.0",
+										method: "textDocument/publishDiagnostics",
+										params: { uri: textDocument.uri, diagnostics },
+									}),
+								250,
+							);
+						}
+						return;
+					}
+					const content = this.#documents.get(textDocument.uri) ?? "";
+					setTimeout(() => {
+						server.send({
+							jsonrpc: "2.0",
+							id: message.id,
+							result: { kind: "full", items: content.includes('"wrong"') ? [MISMATCH] : [] },
+						});
+					}, 75);
 				}
-				const content = this.#documents.get(message.params!.textDocument!.uri) ?? "";
-				setTimeout(() => {
-					send({
-						jsonrpc: "2.0",
-						id: message.id,
-						result: { kind: "full", items: content.includes('"wrong"') ? [MISMATCH] : [] },
-					});
-				}, 75);
-			} else if (message.method === "shutdown") {
-				send({ jsonrpc: "2.0", id: message.id, result: null });
-			} else if (message.method === "exit") {
-				exit();
-			}
-		};
-		let bytes = Buffer.alloc(0);
-		let chain = Promise.resolve();
-		const feed = (raw: string | Uint8Array) => {
-			bytes = Buffer.concat([bytes, typeof raw === "string" ? Buffer.from(raw, "utf-8") : Buffer.from(raw)]);
-			chain = chain.then(() => {
-				while (true) {
-					const headerEnd = bytes.indexOf("\r\n\r\n");
-					if (headerEnd < 0) return;
-					const length = /Content-Length: (\d+)/i.exec(bytes.toString("utf-8", 0, headerEnd))!;
-					const start = headerEnd + 4;
-					const end = start + Number(length[1]);
-					if (bytes.length < end) return;
-					const message = JSON.parse(bytes.toString("utf-8", start, end)) as RpcMessage;
-					bytes = bytes.subarray(end);
-					handle(message);
-				}
-			});
-		};
-		const proc = {
-			exited,
-			get exitCode() {
-				return exitCode;
 			},
-			stdin: {
-				write(chunk: string | Uint8Array) {
-					feed(chunk);
-					return typeof chunk === "string" ? Buffer.byteLength(chunk, "utf-8") : chunk.byteLength;
-				},
-				flush: async () => 0,
-				end: async () => 0,
-			},
-			stdout,
-			peekStderr: () => "",
-			kill: exit,
-		} as unknown as LspClient["proc"];
-		const spawn = (() => proc) as unknown as typeof ptree.spawn;
-		vi.spyOn(ptree, "spawn").mockImplementation(spawn);
+			{ diagnosticProvider: true },
+		);
 	}
 }
 
